@@ -44,6 +44,26 @@ function loadCookies(): Cookie[] {
   // 1. Prefer INSTAGRAM_COOKIES env var (works on Vercel / any serverless host)
   const envCookies = process.env.INSTAGRAM_COOKIES;
   if (envCookies?.trim()) {
+    // Check if it's a JSON array
+    if (envCookies.trim().startsWith('[')) {
+      try {
+        const parsedJson = JSON.parse(envCookies);
+        if (Array.isArray(parsedJson)) {
+          const mapped = parsedJson
+            .map((c: any) => {
+              if (c && typeof c.name === 'string' && typeof c.value === 'string') {
+                return { name: c.name, value: c.value };
+              }
+              return null;
+            })
+            .filter(Boolean) as Cookie[];
+          if (mapped.length > 0) return mapped;
+        }
+      } catch (err) {
+        console.error('Error parsing INSTAGRAM_COOKIES JSON:', err);
+      }
+    }
+
     // Support both raw "key=val; key2=val2" and Netscape tab-separated format
     const parsed = envCookies.includes('\t')
       ? parseNetscapeCookies(envCookies)
