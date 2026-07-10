@@ -23,10 +23,12 @@ interface PostData {
 
 interface FetchResult {
   success: boolean;
+  partial?: boolean;
   data?: PostData;
   error?: string;
   hint?: string;
   code?: string;
+  warning?: string;
 }
 
 /* ─── Helpers ────────────────────────────────────────────── */
@@ -230,21 +232,38 @@ export default function Home() {
               {/* ── Error / Hint ─────────────────────── */}
               {result && !result.success && (
                 <div
-                  className={`message-box message-box--${result.code === 'YTDLP_NOT_FOUND' ? 'warning' : 'error'}`}
+                  className={`message-box message-box--${
+                    result.code === 'YTDLP_NOT_FOUND' ? 'warning'
+                    : result.code === 'NEEDS_LOGIN' ? 'info'
+                    : 'error'
+                  }`}
                   role="alert"
                 >
                   <span className="message-box__icon" aria-hidden="true">
-                    {result.code === 'YTDLP_NOT_FOUND' ? '⚠️' : result.code === 'PRIVATE_POST' ? '🔒' : '❌'}
+                    {result.code === 'YTDLP_NOT_FOUND' ? '⚠️'
+                      : result.code === 'NEEDS_LOGIN' ? '🔐'
+                      : result.code === 'PRIVATE_POST' ? '🔒'
+                      : '❌'}
                   </span>
                   <div className="message-box__content">
                     <p className="message-box__title">{result.error}</p>
-                    {result.hint && (
+                    {result.code === 'NEEDS_LOGIN' && (
+                      <ol className="message-box__steps">
+                        <li>Open <strong>Chrome</strong> or <strong>Edge</strong> on this computer</li>
+                        <li>Go to <strong>instagram.com</strong> and log in to any account</li>
+                        <li>Come back here and click <strong>Fetch Post</strong> again</li>
+                        <li>The app will automatically read your browser&apos;s session</li>
+                      </ol>
+                    )}
+                    {result.code === 'YTDLP_NOT_FOUND' && (
                       <p className="message-box__body">
-                        {result.hint}
-                        {result.code === 'YTDLP_NOT_FOUND' && (
-                          <span className="message-box__code">winget install yt-dlp</span>
-                        )}
+                        Open PowerShell and run:
+                        <span className="message-box__code">winget install yt-dlp</span>
+                        <span className="message-box__code">pip install yt-dlp</span>
                       </p>
+                    )}
+                    {result.hint && result.code !== 'NEEDS_LOGIN' && result.code !== 'YTDLP_NOT_FOUND' && (
+                      <p className="message-box__body">{result.hint}</p>
                     )}
                   </div>
                 </div>
@@ -262,7 +281,9 @@ export default function Home() {
                     >
                       {postData.mediaType === 'video' ? '🎬 Reel / Video' : '🖼️ Photo'}
                     </span>
-                    <span className="result-card__header-title">Post fetched successfully</span>
+                    <span className="result-card__header-title">
+                      {result?.partial ? '⚠️ Preview only — media URL unavailable' : 'Post fetched successfully'}
+                    </span>
                     {postData.resolution && (
                       <span className="result-card__resolution">
                         📐 {postData.resolution}
@@ -278,7 +299,7 @@ export default function Home() {
                         <>
                           {/* eslint-disable-next-line @next/next/no-img-element */}
                           <img
-                            src={postData.thumbnail}
+                            src={`/api/download?url=${encodeURIComponent(postData.thumbnail)}&inline=true`}
                             alt={`Thumbnail for ${postData.title}`}
                             className="result-card__thumbnail"
                             loading="lazy"

@@ -469,6 +469,26 @@ body {
   font-family: 'Courier New', monospace;
   font-size: 0.8rem;
   margin-top: 6px;
+  margin-right: 6px;
+}
+
+.message-box__steps {
+  margin-top: 10px;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.message-box__steps li {
+  font-size: 0.83rem;
+  line-height: 1.5;
+  opacity: 0.9;
+}
+
+.message-box__steps strong {
+  color: #fff;
+  font-weight: 700;
 }
 
 /* ─────────────────────────────────────────────

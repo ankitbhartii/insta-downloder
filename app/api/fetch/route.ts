@@ -1,259 +1,406 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
 
-interface YtDlpFormat {
-  format_id: string;
-  ext: string;
-  width?: number;
-  height?: number;
-  filesize?: number;
-  vcodec?: string;
-  acodec?: string;
-  url: string;
-  quality?: number;
-  tbr?: number;
-  vbr?: number;
-  format_note?: string;
+/* ─── Cookie loader ──────────────────────────────────────────────────── */
+const COOKIES_FILE = path.join(process.cwd(), 'cookies.txt');
+
+interface Cookie { name: string; value: string }
+
+function loadCookies(): Cookie[] {
+  try {
+    if (!fs.existsSync(COOKIES_FILE)) return [];
+    return fs.readFileSync(COOKIES_FILE, 'utf-8')
+      .split('\n')
+      .filter((l) => l.trim() && !l.startsWith('#'))
+      .map((l) => {
+        const p = l.trim().split('\t');
+        return p.length >= 7 ? { name: p[5], value: p[6] } : null;
+      })
+      .filter(Boolean) as Cookie[];
+  } catch { return []; }
 }
 
-interface YtDlpOutput {
+function cookieHeader(cookies: Cookie[]): string {
+  return cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+}
+
+function getCookieVal(cookies: Cookie[], name: string): string {
+  return cookies.find((c) => c.name === name)?.value ?? '';
+}
+
+/* ─── Shortcode helpers ──────────────────────────────────────────────── */
+function extractShortcode(url: string): string | null {
+  const m = url.match(/instagram\.com\/(?:p|reel|tv|stories\/[^/]+)\/([A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+const IG_CHARSET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+function shortcodeToMediaId(sc: string): string {
+  let id = BigInt(0);
+  for (const c of sc) id = id * BigInt(64) + BigInt(IG_CHARSET.indexOf(c));
+  return id.toString();
+}
+
+/* ─── Base fetch headers ─────────────────────────────────────────────── */
+function igHeaders(cookies: Cookie[], referer?: string, extraHeaders?: Record<string, string>) {
+  const csrf = getCookieVal(cookies, 'csrftoken');
+  return {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Cookie: cookieHeader(cookies),
+    'X-IG-App-ID': '936619743392459',
+    'X-CSRFToken': csrf,
+    Referer: referer ?? 'https://www.instagram.com/',
+    Accept: 'application/json',
+    Origin: 'https://www.instagram.com',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+    ...extraHeaders,
+  };
+}
+
+/* ─── Extract lsd token from Instagram homepage ──────────────────────── */
+async function getLsdToken(cookies: Cookie[]): Promise<string> {
+  try {
+    const res = await fetch('https://www.instagram.com/', {
+      headers: {
+        ...igHeaders(cookies),
+        Accept: 'text/html',
+        'Sec-Fetch-Mode': 'navigate',
+      },
+    });
+    const html = await res.text();
+    const m = html.match(/"LSD"\s*,\s*\[\s*\]\s*,\s*\{"token"\s*:\s*"([^"]+)"/);
+    return m?.[1] ?? '';
+  } catch { return ''; }
+}
+
+/* ─── Strategy: Relay GraphQL POST (doc_id rotation) ────────────────── */
+// These are known working doc_ids — we try them in order
+const DOC_IDS = [
+  '10015901848480474',  // xdt_api v1 shortcode (current)
+  '8845758582119845',   // PolarisPostAction
+  '9496696870374771',   // alternate
+  '17991233890457762',  // older web query
+];
+
+interface RelayMediaNode {
+  id?: string;
+  shortcode?: string;
+  __typename?: string;
+  is_video?: boolean;
+  video_url?: string;
+  display_url?: string;
+  display_resources?: Array<{ src: string; config_width: number; config_height: number }>;
+  thumbnail_src?: string;
+  dimensions?: { width: number; height: number };
+  edge_media_to_caption?: { edges: Array<{ node: { text: string } }> };
+  edge_liked_by?: { count: number };
+  edge_media_to_comment?: { count: number };
+  video_view_count?: number;
+  taken_at_timestamp?: number;
+  owner?: { username: string; full_name: string };
+}
+
+async function queryRelayGraphQL(
+  shortcode: string,
+  lsd: string,
+  cookies: Cookie[]
+): Promise<RelayMediaNode | null> {
+  const variables = JSON.stringify({
+    shortcode,
+    fetch_tagged_user_count: null,
+    hoisted_comment_id: null,
+    hoisted_reply_id: null,
+  });
+
+  for (const docId of DOC_IDS) {
+    try {
+      const body = new URLSearchParams({
+        lsd,
+        variables,
+        doc_id: docId,
+      });
+
+      const res = await fetch('https://www.instagram.com/graphql/query', {
+        method: 'POST',
+        headers: {
+          ...igHeaders(cookies, `https://www.instagram.com/p/${shortcode}/`, {
+            'X-FB-LSD': lsd,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          }),
+        },
+        body: body.toString(),
+      });
+
+      if (!res.ok) continue;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const json = await res.json() as any;
+
+      // Check different possible response shapes
+      const media =
+        json?.data?.xdt_shortcode_media ||
+        json?.data?.shortcode_media ||
+        json?.data?.media;
+
+      if (media && (media.display_url || media.video_url || media.id)) {
+        return media as RelayMediaNode;
+      }
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+/* ─── Strategy: scrape HTML page for embedded Relay store ───────────── */
+async function scrapePageHTML(shortcode: string, cookies: Cookie[]): Promise<RelayMediaNode | null> {
+  try {
+    const res = await fetch(`https://www.instagram.com/p/${shortcode}/`, {
+      headers: {
+        ...igHeaders(cookies, 'https://www.google.com/', {
+          Accept: 'text/html,application/xhtml+xml',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'cross-site',
+        }),
+      },
+    });
+    const html = await res.text();
+
+    // Look for any known patterns that contain the media data
+    const patterns = [
+      /"shortcode_media"\s*:\s*(\{[\s\S]{100,}?\})\s*,?\s*"(?:gating_info|edge_web)/,
+      /window\.__additionalDataLoaded\([^,]+,([\s\S]+?)\);/,
+      /"video_url"\s*:\s*"(https:[^"]+)"/,
+    ];
+
+    for (const pat of patterns) {
+      const m = html.match(pat);
+      if (m) {
+        try {
+          const parsed = JSON.parse(m[1]);
+          if (parsed?.display_url || parsed?.video_url) return parsed;
+        } catch {
+          // If it's just a URL string, reconstruct minimal node
+          if (m[1]?.startsWith('http')) {
+            return { video_url: m[1], is_video: true };
+          }
+        }
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/* ─── Strategy: Instagram embed page ────────────────────────────────── */
+async function scrapeEmbedPage(shortcode: string, cookies: Cookie[]): Promise<RelayMediaNode | null> {
+  try {
+    const res = await fetch(`https://www.instagram.com/p/${shortcode}/embed/captioned/`, {
+      headers: {
+        ...igHeaders(cookies, 'https://www.google.com/', {
+          Accept: 'text/html,application/xhtml+xml',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'cross-site',
+        }),
+      },
+    });
+    const html = await res.text();
+
+    // Look in the embed for video/image src values
+    const videoSrc = html.match(/class="[^"]*(?:EmbeddedMedia|CaptionedVideo)[^"]*"[^>]*src="([^"]+)"/)?.[1];
+    const imgSrc = html.match(/class="[^"]*EmbeddedMedia(?:Image)[^"]*"[^>]*src="([^"]+)"/)?.[1];
+    const ownerName = html.match(/class="[^"]*UsernameText[^"]*"[^>]*>([^<]+)</)?.[1];
+    const caption = html.match(/class="[^"]*CaptionText[^"]*"[^>]*>([^<]+)</)?.[1];
+
+    // Also look for any video URL embedded in a script
+    const scriptVideoUrl = html.match(/["']video_url["']\s*:\s*["'](https:[^"']+)["']/)?.[1];
+
+    if (videoSrc || imgSrc || scriptVideoUrl) {
+      return {
+        video_url: videoSrc || scriptVideoUrl,
+        display_url: imgSrc,
+        is_video: !!(videoSrc || scriptVideoUrl),
+        owner: ownerName ? { username: ownerName, full_name: ownerName } : undefined,
+        edge_media_to_caption: caption ? { edges: [{ node: { text: caption } }] } : undefined,
+      };
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/* ─── Strategy: oEmbed for basic metadata ───────────────────────────── */
+interface OEmbedData {
+  thumbnail_url?: string;
+  author_name?: string;
+  title?: string;
+  thumbnail_width?: number;
+  thumbnail_height?: number;
+}
+
+async function fetchOEmbed(url: string): Promise<OEmbedData | null> {
+  try {
+    const res = await fetch(
+      `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(url)}&format=json`,
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          Accept: 'application/json',
+        },
+      }
+    );
+    if (res.ok) return res.json();
+  } catch { /* ignore */ }
+  return null;
+}
+
+/* ─── Build result from RelayMediaNode ──────────────────────────────── */
+interface PostResult {
   id: string;
+  shortcode: string;
   title: string;
   description?: string;
   uploader?: string;
-  uploader_id?: string;
+  uploaderUsername?: string;
   thumbnail?: string;
-  thumbnails?: Array<{ url: string; width?: number; height?: number }>;
-  webpage_url: string;
-  upload_date?: string;
-  like_count?: number;
-  view_count?: number;
-  comment_count?: number;
+  mediaUrl: string | null;
+  mediaType: 'video' | 'image';
+  resolution?: string;
   duration?: number;
-  width?: number;
-  height?: number;
-  ext?: string;
-  url?: string; // direct URL for images
-  formats?: YtDlpFormat[];
-  _type?: string;
+  uploadDate?: string;
+  likeCount?: number;
+  viewCount?: number;
+  commentCount?: number;
+  pageUrl: string;
 }
 
-function runYtDlp(url: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '--dump-json',
-      '--no-playlist',
-      '--no-warnings',
-      '--quiet',
-      url,
-    ];
+function buildResult(node: RelayMediaNode, shortcode: string, pageUrl: string): PostResult {
+  const isVideo = node.is_video || node.__typename === 'GraphVideo' || !!node.video_url;
+  const caption = node.edge_media_to_caption?.edges?.[0]?.node?.text;
 
-    const proc = spawn('yt-dlp', args, { shell: true });
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', (data: Buffer) => {
-      stdout += data.toString();
-    });
-
-    proc.stderr.on('data', (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    proc.on('close', (code: number) => {
-      if (code === 0 && stdout.trim()) {
-        resolve(stdout.trim());
-      } else {
-        reject(new Error(stderr || `yt-dlp exited with code ${code}`));
-      }
-    });
-
-    proc.on('error', (err: Error) => {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        reject(new Error('yt-dlp is not installed. Please install it: winget install yt-dlp'));
-      } else {
-        reject(err);
-      }
-    });
-
-    // timeout after 50 seconds
-    setTimeout(() => {
-      proc.kill();
-      reject(new Error('yt-dlp timed out after 50 seconds'));
-    }, 50000);
-  });
-}
-
-function pickBestVideoFormat(formats: YtDlpFormat[]): YtDlpFormat | null {
-  // Filter formats that have video
-  const videoFormats = formats.filter(
-    (f) => f.vcodec && f.vcodec !== 'none' && f.url
-  );
-
-  if (videoFormats.length === 0) return null;
-
-  // Sort by resolution (height) then by bitrate
-  videoFormats.sort((a, b) => {
-    const heightDiff = (b.height || 0) - (a.height || 0);
-    if (heightDiff !== 0) return heightDiff;
-    return (b.tbr || 0) - (a.tbr || 0);
-  });
-
-  return videoFormats[0];
-}
-
-function pickBestImageFormat(formats: YtDlpFormat[]): YtDlpFormat | null {
-  const imageFormats = formats.filter(
-    (f) => (f.vcodec === 'none' || !f.vcodec) && f.url
-  );
-  return imageFormats.length > 0 ? imageFormats[0] : null;
-}
-
-function formatDate(dateStr?: string): string | undefined {
-  if (!dateStr || dateStr.length !== 8) return dateStr;
-  const year = dateStr.slice(0, 4);
-  const month = dateStr.slice(4, 6);
-  const day = dateStr.slice(6, 8);
-  return new Date(`${year}-${month}-${day}`).toLocaleDateString('en-US', {
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  });
-}
-
-export async function POST(request: NextRequest) {
-  let body: { url?: string };
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  // Best thumbnail
+  let thumbnail = node.display_url || node.thumbnail_src;
+  if (node.display_resources?.length) {
+    const sorted = [...node.display_resources].sort((a, b) => b.config_width - a.config_width);
+    thumbnail = sorted[0].src || thumbnail;
   }
 
-  const { url } = body;
+  const mediaUrl = isVideo ? (node.video_url ?? null) : (node.display_url ?? node.thumbnail_src ?? null);
+  const resolution = node.dimensions ? `${node.dimensions.width}x${node.dimensions.height}` : undefined;
 
+  const ts = node.taken_at_timestamp;
+  const uploadDate = ts
+    ? new Date(ts * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
+    : undefined;
+
+  return {
+    id: node.id ?? shortcode,
+    shortcode,
+    title: node.owner?.full_name
+      ? `${node.owner.full_name}'s ${isVideo ? 'Reel' : 'Photo'}`
+      : 'Instagram Post',
+    description: caption,
+    uploader: node.owner?.full_name,
+    uploaderUsername: node.owner?.username,
+    thumbnail,
+    mediaUrl,
+    mediaType: isVideo ? 'video' : 'image',
+    resolution,
+    uploadDate,
+    likeCount: node.edge_liked_by?.count,
+    viewCount: node.video_view_count,
+    commentCount: node.edge_media_to_comment?.count,
+    pageUrl: pageUrl.split('?')[0].replace(/\/$/, ''),
+  };
+}
+
+/* ─── POST handler ───────────────────────────────────────────────────── */
+export async function POST(request: NextRequest) {
+  let body: { url?: string };
+  try { body = await request.json(); }
+  catch { return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 }); }
+
+  const { url } = body;
   if (!url || typeof url !== 'string') {
     return NextResponse.json({ error: 'URL is required' }, { status: 400 });
   }
 
-  // Validate Instagram URL
-  const igPattern =
-    /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv|stories)\/[A-Za-z0-9_\-]+\/?/;
+  const igPattern = /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv|stories)\/[A-Za-z0-9_\-]+/;
   if (!igPattern.test(url.trim())) {
     return NextResponse.json(
-      { error: 'Please enter a valid Instagram post URL (instagram.com/p/... or /reel/...)' },
+      { error: 'Please enter a valid Instagram URL (instagram.com/p/… or /reel/…)' },
       { status: 400 }
     );
   }
 
+  const shortcode = extractShortcode(url.trim());
+  if (!shortcode) {
+    return NextResponse.json({ error: 'Could not extract post ID from URL.' }, { status: 400 });
+  }
+
+  const cookies = loadCookies();
+  const hasCookies = cookies.length > 0;
+
   try {
-    const rawJson = await runYtDlp(url.trim());
+    let node: RelayMediaNode | null = null;
 
-    // yt-dlp may return multiple JSON lines for slideshows; take first
-    const firstLine = rawJson.split('\n').find((l) => l.trim().startsWith('{'));
-    if (!firstLine) throw new Error('No JSON output from yt-dlp');
+    // Step 1: Get lsd token (needed for Relay queries)
+    const lsd = hasCookies ? await getLsdToken(cookies) : '';
 
-    const data: YtDlpOutput = JSON.parse(firstLine);
+    // Step 2: Try Relay GraphQL (requires cookies + lsd)
+    if (hasCookies && lsd) {
+      node = await queryRelayGraphQL(shortcode, lsd, cookies);
+    }
 
-    // Determine media type
-    const isVideo =
-      data.formats?.some((f) => f.vcodec && f.vcodec !== 'none') ||
-      data.ext === 'mp4';
+    // Step 3: Scrape HTML page
+    if (!node) {
+      node = await scrapePageHTML(shortcode, hasCookies ? cookies : []);
+    }
 
-    let mediaUrl: string | null = null;
-    let mediaType: 'video' | 'image' = 'image';
-    let resolution: string | undefined;
+    // Step 4: Scrape embed page
+    if (!node) {
+      node = await scrapeEmbedPage(shortcode, hasCookies ? cookies : []);
+    }
 
-    if (data.formats && data.formats.length > 0) {
-      if (isVideo) {
-        const best = pickBestVideoFormat(data.formats);
-        if (best) {
-          mediaUrl = best.url;
-          mediaType = 'video';
-          resolution = best.width && best.height ? `${best.width}x${best.height}` : undefined;
-        }
-      } else {
-        const best = pickBestImageFormat(data.formats);
-        if (best) {
-          mediaUrl = best.url;
-          mediaType = 'image';
-        }
+    // Step 5: oEmbed partial fallback
+    if (!node) {
+      const oembed = await fetchOEmbed(url.trim());
+      if (oembed?.thumbnail_url) {
+        return NextResponse.json({
+          success: true,
+          partial: true,
+          data: {
+            id: shortcode,
+            shortcode,
+            title: oembed.title || 'Instagram Post',
+            uploader: oembed.author_name,
+            uploaderUsername: undefined,
+            thumbnail: oembed.thumbnail_url,
+            mediaUrl: null,
+            mediaType: 'image' as const,
+            resolution: oembed.thumbnail_width && oembed.thumbnail_height
+              ? `${oembed.thumbnail_width}x${oembed.thumbnail_height}` : undefined,
+            pageUrl: `https://www.instagram.com/p/${shortcode}/`,
+          },
+          warning: 'Only preview available. The direct download link could not be extracted. Instagram may have updated their API — try refreshing your cookies.',
+        });
       }
+
+      return NextResponse.json({
+        error: 'Could not extract media from this post.',
+        hint: hasCookies
+          ? 'Your session cookies may have expired. Export fresh cookies from instagram.com and paste them again.'
+          : 'Paste your Instagram session cookies to enable downloads.',
+        code: 'EXTRACT_FAILED',
+      }, { status: 502 });
     }
 
-    // Fallback: direct URL (for images or simpler posts)
-    if (!mediaUrl && data.url) {
-      mediaUrl = data.url;
-      mediaType = data.ext === 'mp4' ? 'video' : 'image';
-    }
+    const result = buildResult(node, shortcode, url.trim());
+    return NextResponse.json({ success: true, data: result });
 
-    // Pick best thumbnail
-    let thumbnail = data.thumbnail;
-    if (data.thumbnails && data.thumbnails.length > 0) {
-      const sorted = [...data.thumbnails].sort(
-        (a, b) => (b.width || 0) - (a.width || 0)
-      );
-      thumbnail = sorted[0].url || thumbnail;
-    }
-
-    return NextResponse.json({
-      success: true,
-      data: {
-        id: data.id,
-        title: data.title || 'Instagram Post',
-        description: data.description,
-        uploader: data.uploader,
-        uploaderUsername: data.uploader_id,
-        thumbnail,
-        mediaUrl,
-        mediaType,
-        resolution,
-        duration: data.duration,
-        uploadDate: formatDate(data.upload_date),
-        likeCount: data.like_count,
-        viewCount: data.view_count,
-        commentCount: data.comment_count,
-        pageUrl: data.webpage_url || url.trim(),
-      },
-    });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-
-    // Provide helpful error messages
-    if (message.includes('not installed') || message.includes('ENOENT')) {
-      return NextResponse.json(
-        {
-          error: 'yt-dlp is not installed on this system.',
-          hint: 'Run: winget install yt-dlp  (or: pip install yt-dlp)',
-          code: 'YTDLP_NOT_FOUND',
-        },
-        { status: 503 }
-      );
-    }
-
-    if (message.includes('private') || message.includes('login')) {
-      return NextResponse.json(
-        {
-          error: 'This post is private or requires login.',
-          hint: 'Only public Instagram posts can be downloaded without authentication.',
-          code: 'PRIVATE_POST',
-        },
-        { status: 403 }
-      );
-    }
-
-    if (message.includes('timed out')) {
-      return NextResponse.json(
-        { error: 'Request timed out. Instagram may be rate-limiting. Try again in a moment.', code: 'TIMEOUT' },
-        { status: 408 }
-      );
-    }
-
-    return NextResponse.json(
-      { error: `Failed to fetch post: ${message}` },
-      { status: 500 }
-    );
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    return NextResponse.json({ error: `Server error: ${msg}` }, { status: 500 });
   }
 }

@@ -54,13 +54,14 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const contentType = response.headers.get('content-type') || `video/${ext}`;
+    const isInline = searchParams.get('inline') === 'true';
+    const contentType = response.headers.get('content-type') || (isInline ? 'image/jpeg' : `video/${ext}`);
     const contentLength = response.headers.get('content-length');
 
     const headers: HeadersInit = {
       'Content-Type': contentType,
-      'Content-Disposition': `attachment; filename="${filename}.${ext}"`,
-      'Cache-Control': 'no-store',
+      'Content-Disposition': isInline ? 'inline' : `attachment; filename="${filename}.${ext}"`,
+      'Cache-Control': isInline ? 'public, max-age=31536000, immutable' : 'no-store',
     };
 
     if (contentLength) {
