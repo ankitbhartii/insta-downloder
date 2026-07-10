@@ -10,19 +10,54 @@ const COOKIES_FILE = path.join(process.cwd(), 'cookies.txt');
 
 interface Cookie { name: string; value: string }
 
+/**
+ * Parse raw "key=value; key2=value2" cookie string (e.g. from env var).
+ */
+function parseRawCookieString(raw: string): Cookie[] {
+  return raw
+    .split(';')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => {
+      const eq = s.indexOf('=');
+      if (eq === -1) return null;
+      return { name: s.slice(0, eq).trim(), value: s.slice(eq + 1).trim() };
+    })
+    .filter(Boolean) as Cookie[];
+}
+
+/**
+ * Parse Netscape / yt-dlp tab-separated cookies.txt format.
+ */
+function parseNetscapeCookies(text: string): Cookie[] {
+  return text
+    .split('\n')
+    .filter(l => l.trim() && !l.startsWith('#'))
+    .map(l => {
+      const p = l.trim().split('\t');
+      return p.length >= 7 ? { name: p[5], value: p[6] } : null;
+    })
+    .filter(Boolean) as Cookie[];
+}
+
 function loadCookies(): Cookie[] {
+  // 1. Prefer INSTAGRAM_COOKIES env var (works on Vercel / any serverless host)
+  const envCookies = process.env.INSTAGRAM_COOKIES;
+  if (envCookies?.trim()) {
+    // Support both raw "key=val; key2=val2" and Netscape tab-separated format
+    const parsed = envCookies.includes('\t')
+      ? parseNetscapeCookies(envCookies)
+      : parseRawCookieString(envCookies);
+    if (parsed.length > 0) return parsed;
+  }
+
+  // 2. Fall back to local cookies.txt
   try {
     if (!fs.existsSync(COOKIES_FILE)) return [];
-    return fs.readFileSync(COOKIES_FILE, 'utf-8')
-      .split('\n')
-      .filter((l) => l.trim() && !l.startsWith('#'))
-      .map((l) => {
-        const p = l.trim().split('\t');
-        return p.length >= 7 ? { name: p[5], value: p[6] } : null;
-      })
-      .filter(Boolean) as Cookie[];
+    return parseNetscapeCookies(fs.readFileSync(COOKIES_FILE, 'utf-8'));
   } catch { return []; }
 }
+
 
 function cookieHeader(cookies: Cookie[]): string {
   return cookies.map((c) => `${c.name}=${c.value}`).join('; ');
