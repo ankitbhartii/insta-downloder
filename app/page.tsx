@@ -2,7 +2,14 @@
 
 import { useState, useRef, useCallback } from 'react';
 
-/* ─── Types ─────────────────────────────────────────────── */
+/* ─── Types ──────────────────────────────────────────────── */
+interface MediaItem {
+  url: string;
+  thumbnail: string;
+  mediaType: 'video' | 'image';
+  resolution?: string;
+}
+
 interface PostData {
   id: string;
   title: string;
@@ -19,6 +26,8 @@ interface PostData {
   viewCount?: number;
   commentCount?: number;
   pageUrl: string;
+  mediaItems?: MediaItem[];
+  isCarousel?: boolean;
 }
 
 interface FetchResult {
@@ -32,550 +41,441 @@ interface FetchResult {
 }
 
 /* ─── Helpers ────────────────────────────────────────────── */
-function formatCount(n?: number): string {
-  if (n === undefined || n === null) return '—';
+const fmtN = (n?: number) => {
+  if (n === undefined || n === null) return null;
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
   return n.toLocaleString();
+};
+const initial  = (s?: string) => s?.charAt(0).toUpperCase() ?? '?';
+const fmtDate  = (d?: string) => d ? new Date(d).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : null;
+const fmtDur   = (s?: number) => s ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}` : '';
+const proxyUrl = (u: string, inline = false) =>
+  `/api/download?url=${encodeURIComponent(u)}${inline ? '&inline=true' : ''}`;
+
+/* ─── Single-item downloader ─────────────────────────────── */
+function triggerDownload(url: string, filename: string) {
+  const a = Object.assign(document.createElement('a'), { href: url, download: filename });
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 
-function formatDuration(secs?: number): string {
-  if (!secs) return '';
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
-}
+/* ─── Carousel Slide component ───────────────────────────── */
+function CarouselSlide({
+  item, index, total, onDownload, downloading,
+}: {
+  item: MediaItem; index: number; total: number;
+  onDownload: (item: MediaItem, idx: number) => void;
+  downloading: boolean;
+}) {
+  return (
+    <div className="slide">
+      {/* slide number */}
+      <div className="slide__counter">{index + 1} / {total}</div>
 
-function getInitial(name?: string): string {
-  if (!name) return '?';
-  return name.charAt(0).toUpperCase();
-}
+      {/* media */}
+      <div className="slide__media">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={proxyUrl(item.thumbnail, true)}
+          alt={`Slide ${index + 1}`}
+          loading="lazy"
+        />
+        {item.mediaType === 'video' && <div className="video-badge">▶ Reel</div>}
+      </div>
 
-/* ─── Component ─────────────────────────────────────────── */
-export default function Home() {
-  const [url, setUrl] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<FetchResult | null>(null);
-  const [downloading, setDownloading] = useState(false);
-  const [downloadDone, setDownloadDone] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  /* Paste from clipboard */
-  const handlePaste = useCallback(async () => {
-    try {
-      const text = await navigator.clipboard.readText();
-      setUrl(text);
-      inputRef.current?.focus();
-    } catch {
-      inputRef.current?.focus();
-    }
-  }, []);
-
-  /* Fetch post metadata */
-  const handleFetch = useCallback(async () => {
-    const trimmed = url.trim();
-    if (!trimmed) return;
-
-    setLoading(true);
-    setResult(null);
-    setDownloadDone(false);
-
-    try {
-      const res = await fetch('/api/fetch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: trimmed }),
-      });
-
-      const json: FetchResult = await res.json();
-      setResult(json);
-    } catch {
-      setResult({ success: false, error: 'Network error. Please check your connection.' });
-    } finally {
-      setLoading(false);
-    }
-  }, [url]);
-
-  /* Keyboard submit */
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLInputElement>) => {
-      if (e.key === 'Enter') handleFetch();
-    },
-    [handleFetch]
+      {/* per-slide download */}
+      <div className="slide__actions">
+        {item.resolution && <span className="slide__res">{item.resolution}</span>}
+        <button
+          className="btn-slide-dl"
+          disabled={downloading}
+          onClick={() => onDownload(item, index)}
+        >
+          {downloading ? <><span className="spinner sm" /> Saving…</> : <>⬇ Download</>}
+        </button>
+      </div>
+    </div>
   );
+}
 
-  /* Download via proxy */
-  const handleDownload = useCallback(async () => {
-    if (!result?.data?.mediaUrl) return;
+/* ─── Carousel component ─────────────────────────────────── */
+function Carousel({ items, postId }: { items: MediaItem[]; postId: string }) {
+  const [active, setActive]   = useState(0);
+  const [dlIdx, setDlIdx]     = useState<number | null>(null);
+  const [dlAll, setDlAll]     = useState(false);
+  const [doneSet, setDoneSet] = useState<Set<number>>(new Set());
 
-    const { mediaUrl, mediaType, uploader, id } = result.data;
-    const ext = mediaType === 'video' ? 'mp4' : 'jpg';
-    const filename = `instadown-${uploader || id}`;
+  const downloadOne = async (item: MediaItem, idx: number) => {
+    setDlIdx(idx);
+    const ext  = item.mediaType === 'video' ? 'mp4' : 'jpg';
+    const name = `instadown-${postId}-${idx + 1}.${ext}`;
+    triggerDownload(proxyUrl(item.url), name);
+    await new Promise(r => setTimeout(r, 800));
+    setDoneSet(prev => new Set([...prev, idx]));
+    setDlIdx(null);
+  };
 
-    setDownloading(true);
-    setDownloadDone(false);
-
-    try {
-      const proxyUrl = `/api/download?url=${encodeURIComponent(mediaUrl)}&filename=${encodeURIComponent(filename)}&ext=${ext}`;
-      const response = await fetch(proxyUrl);
-
-      if (!response.ok) {
-        // Fallback: open direct link in new tab
-        window.open(mediaUrl, '_blank');
-        setDownloadDone(true);
-        return;
-      }
-
-      const blob = await response.blob();
-      const objectUrl = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = objectUrl;
-      anchor.download = `${filename}.${ext}`;
-      anchor.click();
-      URL.revokeObjectURL(objectUrl);
-      setDownloadDone(true);
-    } catch {
-      // Fallback to direct open
-      window.open(mediaUrl, '_blank');
-      setDownloadDone(true);
-    } finally {
-      setDownloading(false);
+  const downloadAll = async () => {
+    setDlAll(true);
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const ext  = item.mediaType === 'video' ? 'mp4' : 'jpg';
+      triggerDownload(proxyUrl(item.url), `instadown-${postId}-${i + 1}.${ext}`);
+      await new Promise(r => setTimeout(r, 600)); // stagger so browser doesn't block
     }
-  }, [result]);
-
-  const postData = result?.success ? result.data : null;
+    setDoneSet(new Set(items.map((_, i) => i)));
+    setDlAll(false);
+  };
 
   return (
-    <div className="page-wrapper">
-      {/* ── Navbar ─────────────────────────────────── */}
-      <nav className="navbar" aria-label="Main navigation">
-        <div className="container navbar__inner">
-          <a href="/" className="navbar__logo" aria-label="InstaDown home">
-            <span className="navbar__logo-icon" aria-hidden="true">📸</span>
-            <span className="navbar__logo-text">InstaDown</span>
-          </a>
-          <span className="navbar__badge">Free &amp; Open</span>
-        </div>
+    <div className="carousel">
+      {/* thumbnail strip nav */}
+      <div className="carousel__strip">
+        {items.map((item, i) => (
+          <button
+            key={i}
+            className={`strip-thumb${i === active ? ' active' : ''}${doneSet.has(i) ? ' done' : ''}`}
+            onClick={() => setActive(i)}
+            aria-label={`View slide ${i + 1}`}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={proxyUrl(item.thumbnail, true)} alt={`Slide ${i + 1}`} loading="lazy" />
+            {doneSet.has(i) && <span className="strip-done">✓</span>}
+            {item.mediaType === 'video' && <span className="strip-video">▶</span>}
+          </button>
+        ))}
+      </div>
+
+      {/* active slide */}
+      <CarouselSlide
+        key={active}
+        item={items[active]}
+        index={active}
+        total={items.length}
+        onDownload={downloadOne}
+        downloading={dlIdx === active}
+      />
+
+      {/* prev / next arrows */}
+      <div className="carousel__nav">
+        <button
+          className="nav-arrow"
+          onClick={() => setActive(i => Math.max(0, i - 1))}
+          disabled={active === 0}
+          aria-label="Previous"
+        >←</button>
+        <span className="carousel__dots">
+          {items.map((_, i) => (
+            <span
+              key={i}
+              className={`dot${i === active ? ' active' : ''}`}
+              onClick={() => setActive(i)}
+            />
+          ))}
+        </span>
+        <button
+          className="nav-arrow"
+          onClick={() => setActive(i => Math.min(items.length - 1, i + 1))}
+          disabled={active === items.length - 1}
+          aria-label="Next"
+        >→</button>
+      </div>
+
+      {/* Download All */}
+      <div className="carousel__dl-all">
+        <button className="btn-dl-all" onClick={downloadAll} disabled={dlAll}>
+          {dlAll
+            ? <><span className="spinner sm" /> Downloading all {items.length} files…</>
+            : <>📦 Download All {items.length} {items.every(i => i.mediaType === 'image') ? 'Photos' : 'Files'}</>}
+        </button>
+        {doneSet.size === items.length && (
+          <span className="done-chip">✓ All saved!</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Main Component ─────────────────────────────────────── */
+export default function Home() {
+  const [url, setUrl]         = useState('');
+  const [loading, setLoading] = useState(false);
+  const [result, setResult]   = useState<FetchResult | null>(null);
+  const [downloading, setDl]  = useState(false);
+  const [done, setDone]       = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const paste = useCallback(async () => {
+    try { const t = await navigator.clipboard.readText(); setUrl(t); }
+    catch { /* ignore */ }
+    inputRef.current?.focus();
+  }, []);
+
+  const fetch_ = useCallback(async () => {
+    const t = url.trim();
+    if (!t) return;
+    setLoading(true); setResult(null); setDone(false);
+    try {
+      const r = await fetch(`/api/fetch?url=${encodeURIComponent(t)}`);
+      setResult(await r.json());
+    } catch {
+      setResult({ success: false, error: 'Network error. Please check your connection.' });
+    } finally { setLoading(false); }
+  }, [url]);
+
+  const downloadSingle = useCallback(async (p: PostData) => {
+    if (!p.mediaUrl) return;
+    setDl(true);
+    try {
+      const ext  = p.mediaType === 'video' ? 'mp4' : 'jpg';
+      triggerDownload(proxyUrl(p.mediaUrl), `instadown-${p.id}.${ext}`);
+      await new Promise(r => setTimeout(r, 800));
+      setDone(true);
+    } finally { setDl(false); }
+  }, []);
+
+  const p = result?.data;
+
+  return (
+    <>
+      {/* ── Navbar ── */}
+      <nav className="nav">
+        <span className="nav__logo">InstaDown</span>
+        <span className="nav__badge">Free &amp; Open Source</span>
       </nav>
 
-      <main>
-        {/* ── Hero ───────────────────────────────────── */}
-        <section className="hero" aria-labelledby="hero-title">
-          <div className="container">
-            <div className="hero__eyebrow">
-              <span className="hero__eyebrow-dot" aria-hidden="true" />
-              Powered by yt-dlp reverse engineering
-            </div>
-            <h1 id="hero-title" className="hero__title">
-              Download Instagram{' '}
-              <span className="hero__title-gradient">Photos &amp; Reels</span>
-              <br />in High Quality
-            </h1>
-            <p className="hero__subtitle">
-              Paste any public Instagram post link and download images or videos
-              in the highest available quality — no login, no watermarks, completely free.
-            </p>
+      {/* ── Page ── */}
+      <main className="page">
+
+        {/* ── Hero ── */}
+        <div className="hero">
+          <div className="hero__icon">📸</div>
+          <h1 className="hero__title">
+            Download <span className="accent">Instagram</span><br />
+            Photos &amp; Reels
+          </h1>
+          <p className="hero__sub">
+            Paste any Instagram post link and instantly save it in full quality — single photos, Reels, or full carousel albums.
+          </p>
+        </div>
+
+        {/* ── Downloader Card ── */}
+        <div className="dl-card">
+          <div className="input-wrap">
+            <input
+              ref={inputRef}
+              id="instagram-url"
+              type="url"
+              className="url-input"
+              placeholder="Paste Instagram link here…"
+              value={url}
+              onChange={e => setUrl(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && fetch_()}
+              autoComplete="off"
+              spellCheck={false}
+              aria-label="Instagram post URL"
+            />
+            <button className="btn-paste" onClick={paste} type="button">
+              📋 Paste
+            </button>
           </div>
-        </section>
 
-        {/* ── Input ──────────────────────────────────── */}
-        <section className="input-section" aria-label="Download form">
-          <div className="container">
-            <div className="input-card">
-              <label htmlFor="ig-url-input" className="input-label">
-                Instagram Post URL
-              </label>
-              <div className="input-row">
-                <input
-                  id="ig-url-input"
-                  ref={inputRef}
-                  type="url"
-                  className="url-input"
-                  placeholder="https://www.instagram.com/p/... or /reel/..."
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  aria-label="Instagram post URL"
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <button
-                  id="paste-btn"
-                  className="btn btn--secondary"
-                  onClick={handlePaste}
-                  type="button"
-                  title="Paste from clipboard"
-                  aria-label="Paste URL from clipboard"
-                >
-                  📋 Paste
-                </button>
-                <button
-                  id="fetch-btn"
-                  className="btn btn--primary"
-                  onClick={handleFetch}
-                  disabled={loading || !url.trim()}
-                  type="button"
-                  aria-label="Fetch Instagram post"
-                  aria-busy={loading}
-                >
-                  {loading ? (
-                    <>
-                      <span className="spinner" aria-hidden="true" />
-                      Fetching…
-                    </>
-                  ) : (
-                    <>🔍 Fetch Post</>
-                  )}
-                </button>
+          <button
+            className="btn-fetch"
+            onClick={fetch_}
+            disabled={loading || !url.trim()}
+            type="button"
+            id="fetch-btn"
+          >
+            {loading
+              ? <><span className="spinner" /> Fetching…</>
+              : <><span>✦</span> Fetch Post</>}
+          </button>
+
+          {!result && !loading && (
+            <>
+              <div className="divider">supported links</div>
+              <div style={{ display:'flex', gap:'0.5rem', justifyContent:'center', flexWrap:'wrap' }}>
+                {['instagram.com/p/…', 'instagram.com/reel/…'].map(l => (
+                  <span key={l} style={{
+                    fontSize:'0.72rem', color:'var(--text-2)',
+                    background:'var(--bg)', border:'1px solid var(--border)',
+                    borderRadius:'var(--r-pill)', padding:'0.2rem 0.65rem'
+                  }}>{l}</span>
+                ))}
               </div>
+            </>
+          )}
+        </div>
 
-              {/* ── Error / Hint ─────────────────────── */}
-              {result && !result.success && (
-                <div
-                  className={`message-box message-box--${
-                    result.code === 'YTDLP_NOT_FOUND' ? 'warning'
-                    : result.code === 'NEEDS_LOGIN' ? 'info'
-                    : 'error'
-                  }`}
-                  role="alert"
-                >
-                  <span className="message-box__icon" aria-hidden="true">
-                    {result.code === 'YTDLP_NOT_FOUND' ? '⚠️'
-                      : result.code === 'NEEDS_LOGIN' ? '🔐'
-                      : result.code === 'PRIVATE_POST' ? '🔒'
-                      : '❌'}
+        {/* ── Result ── */}
+        {result && (
+          <div className="result">
+            {result.success && p ? (
+              <article className="post-card">
+                {/* Instagram-style header */}
+                <header className="post-header">
+                  <div className="avatar-ring">
+                    <div className="avatar-inner">{initial(p.uploader)}</div>
+                  </div>
+                  <div className="post-author">
+                    <div className="post-name">{p.uploader || 'Unknown'}</div>
+                    {p.uploaderUsername && <div className="post-handle">@{p.uploaderUsername}</div>}
+                  </div>
+                  <span className="post-type-badge">
+                    {p.isCarousel ? `🖼️ Album (${p.mediaItems?.length})` : p.mediaType === 'video' ? '🎬 Reel' : '🖼️ Photo'}
                   </span>
-                  <div className="message-box__content">
-                    <p className="message-box__title">{result.error}</p>
-                    {result.code === 'NEEDS_LOGIN' && (
-                      <ol className="message-box__steps">
-                        <li>Open <strong>Chrome</strong> or <strong>Edge</strong> on this computer</li>
-                        <li>Go to <strong>instagram.com</strong> and log in to any account</li>
-                        <li>Come back here and click <strong>Fetch Post</strong> again</li>
-                        <li>The app will automatically read your browser&apos;s session</li>
-                      </ol>
-                    )}
-                    {result.code === 'YTDLP_NOT_FOUND' && (
-                      <p className="message-box__body">
-                        Open PowerShell and run:
-                        <span className="message-box__code">winget install yt-dlp</span>
-                        <span className="message-box__code">pip install yt-dlp</span>
-                      </p>
-                    )}
-                    {result.hint && result.code !== 'NEEDS_LOGIN' && result.code !== 'YTDLP_NOT_FOUND' && (
-                      <p className="message-box__body">{result.hint}</p>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
+                </header>
 
-            {/* ── Result Card ──────────────────────────── */}
-            {postData && (
-              <div className="result-section" aria-live="polite" aria-label="Post details">
-                <div className="result-card">
-                  {/* Header */}
-                  <div className="result-card__header">
-                    <span
-                      className={`result-card__badge result-card__badge--${postData.mediaType}`}
-                    >
-                      {postData.mediaType === 'video' ? '🎬 Reel / Video' : '🖼️ Photo'}
-                    </span>
-                    <span className="result-card__header-title">
-                      {result?.partial ? '⚠️ Preview only — media URL unavailable' : 'Post fetched successfully'}
-                    </span>
-                    {postData.resolution && (
-                      <span className="result-card__resolution">
-                        📐 {postData.resolution}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Body */}
-                  <div className="result-card__body">
-                    {/* Thumbnail */}
-                    <div className="result-card__thumbnail-wrap">
-                      {postData.thumbnail ? (
-                        <>
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src={`/api/download?url=${encodeURIComponent(postData.thumbnail)}&inline=true`}
-                            alt={`Thumbnail for ${postData.title}`}
-                            className="result-card__thumbnail"
-                            loading="lazy"
-                          />
-                          <div className="result-card__thumbnail-overlay">
-                            {postData.mediaType === 'video' && postData.duration && (
-                              <span className="result-card__play-badge">
-                                ▶️ {formatDuration(postData.duration)}
-                              </span>
-                            )}
-                          </div>
-                        </>
-                      ) : (
-                        <div
-                          className="result-card__thumbnail skeleton"
-                          style={{ width: '100%', height: '100%' }}
-                          aria-hidden="true"
+                {/* ── CAROUSEL ── */}
+                {p.isCarousel && p.mediaItems && p.mediaItems.length > 0 ? (
+                  <Carousel items={p.mediaItems} postId={p.id} />
+                ) : (
+                  /* ── SINGLE media ── */
+                  <>
+                    {p.thumbnail ? (
+                      <div className="post-image">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={proxyUrl(p.thumbnail, true)}
+                          alt={`Post by ${p.uploader}`}
+                          loading="lazy"
                         />
-                      )}
-                    </div>
-
-                    {/* Info */}
-                    <div className="result-card__info">
-                      {/* Author */}
-                      <div className="result-card__author">
-                        <div
-                          className="result-card__avatar"
-                          aria-label={`Avatar for ${postData.uploader || 'user'}`}
-                        >
-                          {getInitial(postData.uploader)}
-                        </div>
-                        <div>
-                          <div className="result-card__author-name">
-                            {postData.uploader || 'Unknown User'}
-                          </div>
-                          {postData.uploaderUsername && (
-                            <div className="result-card__author-handle">
-                              @{postData.uploaderUsername}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Title */}
-                      {postData.title && postData.title !== 'Instagram Post' && (
-                        <p className="result-card__title">{postData.title}</p>
-                      )}
-
-                      {/* Description */}
-                      {postData.description && (
-                        <p className="result-card__description">{postData.description}</p>
-                      )}
-
-                      {/* Meta Stats */}
-                      <div className="result-card__meta" aria-label="Post statistics">
-                        {postData.likeCount !== undefined && (
-                          <div className="result-card__meta-item">
-                            <span className="result-card__meta-icon" aria-hidden="true">❤️</span>
-                            <span className="result-card__meta-value">
-                              {formatCount(postData.likeCount)}
-                            </span>
-                            <span>likes</span>
-                          </div>
-                        )}
-                        {postData.viewCount !== undefined && (
-                          <div className="result-card__meta-item">
-                            <span className="result-card__meta-icon" aria-hidden="true">👁️</span>
-                            <span className="result-card__meta-value">
-                              {formatCount(postData.viewCount)}
-                            </span>
-                            <span>views</span>
-                          </div>
-                        )}
-                        {postData.commentCount !== undefined && (
-                          <div className="result-card__meta-item">
-                            <span className="result-card__meta-icon" aria-hidden="true">💬</span>
-                            <span className="result-card__meta-value">
-                              {formatCount(postData.commentCount)}
-                            </span>
-                            <span>comments</span>
-                          </div>
+                        {p.mediaType === 'video' && (
+                          <div className="video-badge">▶ {fmtDur(p.duration) || 'Reel'}</div>
                         )}
                       </div>
-
-                      <div className="result-card__divider" aria-hidden="true" />
-
-                      {/* Download Buttons */}
-                      <div className="result-card__download">
-                        <p className="result-card__download-label">
-                          Download {postData.mediaType === 'video' ? 'Video' : 'Image'}
-                          {postData.resolution ? ` (${postData.resolution})` : ' (Highest Quality)'}
-                        </p>
-
-                        {postData.mediaUrl ? (
-                          <>
-                            <button
-                              id="download-btn"
-                              className={`btn ${postData.mediaType === 'video' ? 'btn--download-reel' : 'btn--download'}`}
-                              onClick={handleDownload}
-                              disabled={downloading}
-                              type="button"
-                              aria-label={`Download ${postData.mediaType === 'video' ? 'video' : 'image'}`}
-                              aria-busy={downloading}
-                            >
-                              {downloading ? (
-                                <>
-                                  <span className="spinner" aria-hidden="true" />
-                                  Downloading…
-                                </>
-                              ) : (
-                                <>
-                                  {postData.mediaType === 'video' ? '🎬' : '📥'}{' '}
-                                  Download {postData.mediaType === 'video' ? 'Reel / Video' : 'Photo'}
-                                </>
-                              )}
-                            </button>
-
-                            <a
-                              id="open-direct-link"
-                              href={postData.mediaUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="btn btn--secondary btn--sm"
-                              aria-label="Open direct media link in new tab"
-                            >
-                              🔗 Direct Link
-                            </a>
-
-                            {downloadDone && !downloading && (
-                              <p className="download-progress" role="status">
-                                ✅ Download started!
-                              </p>
-                            )}
-                          </>
-                        ) : (
-                          <div className="message-box message-box--info" style={{ marginTop: 0, width: '100%' }}>
-                            <span className="message-box__icon" aria-hidden="true">ℹ️</span>
-                            <div className="message-box__content">
-                              <p className="message-box__title">Media URL unavailable</p>
-                              <p className="message-box__body">
-                                The direct media link couldn&apos;t be extracted. This may be a private post
-                                or a story. Try opening the post directly on Instagram.
-                              </p>
-                            </div>
-                          </div>
-                        )}
+                    ) : (
+                      <div className="post-image-placeholder">
+                        <span>📷</span>
+                        <span>{p.mediaType === 'video' ? 'Reel' : 'Photo'}</span>
                       </div>
-                    </div>
+                    )}
+                  </>
+                )}
+
+                {/* Action icons */}
+                {!p.isCarousel && (
+                  <div className="post-actions">
+                    <div className="action-icon heart">🤍</div>
+                    <div className="action-icon">💬</div>
+                    <div className="action-icon">📤</div>
+                    <div className="action-icon action-icon-ml">🔖</div>
                   </div>
+                )}
 
-                  {/* Footer */}
-                  <div className="result-card__footer">
-                    <a
-                      href={postData.pageUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="result-card__source-link"
-                      aria-label="Open original Instagram post"
-                    >
-                      🔗 View on Instagram
-                    </a>
-                    {postData.uploadDate && (
-                      <span className="result-card__date" aria-label={`Posted on ${postData.uploadDate}`}>
-                        📅 {postData.uploadDate}
-                      </span>
+                {/* Stats */}
+                {(fmtN(p.likeCount) || fmtN(p.commentCount) || fmtN(p.viewCount)) && (
+                  <div className="post-stats">
+                    {fmtN(p.likeCount) && (
+                      <div className="stat-item">
+                        <span className="stat-val">{fmtN(p.likeCount)}</span>
+                        <span className="stat-key">likes</span>
+                      </div>
+                    )}
+                    {fmtN(p.commentCount) && (
+                      <div className="stat-item">
+                        <span className="stat-val">{fmtN(p.commentCount)}</span>
+                        <span className="stat-key">comments</span>
+                      </div>
+                    )}
+                    {fmtN(p.viewCount) && (
+                      <div className="stat-item">
+                        <span className="stat-val">{fmtN(p.viewCount)}</span>
+                        <span className="stat-key">views</span>
+                      </div>
+                    )}
+                    {p.resolution && (
+                      <div className="stat-item" style={{ marginLeft:'auto' }}>
+                        <span className="stat-val" style={{ fontSize:'0.78rem' }}>{p.resolution}</span>
+                        <span className="stat-key">resolution</span>
+                      </div>
                     )}
                   </div>
-                </div>
+                )}
+
+                {/* Caption */}
+                {(p.uploader || p.description) && (
+                  <div className="post-caption">
+                    {p.uploader && <strong>{p.uploader}</strong>}
+                    {p.description && <p>{p.description}</p>}
+                  </div>
+                )}
+
+                {fmtDate(p.uploadDate) && (
+                  <div className="post-date">{fmtDate(p.uploadDate)}</div>
+                )}
+
+                {/* Download bar — only for single media */}
+                {!p.isCarousel && (
+                  <div className="post-download">
+                    {p.mediaUrl ? (
+                      <button
+                        className="btn-download-main"
+                        onClick={() => downloadSingle(p)}
+                        disabled={downloading}
+                        id="download-btn"
+                      >
+                        {downloading
+                          ? <><span className="spinner" /> Downloading…</>
+                          : <>⬇ Download {p.mediaType === 'video' ? 'Reel' : 'Photo'}</>}
+                      </button>
+                    ) : (
+                      <div style={{ flex:1, fontSize:'0.78rem', color:'var(--text-2)' }}>
+                        ⚠️ Direct media URL unavailable
+                      </div>
+                    )}
+                    <a href={p.pageUrl} target="_blank" rel="noopener noreferrer" className="btn-view">
+                      ↗ View
+                    </a>
+                    {done && <span className="done-chip">✓ Saved!</span>}
+                  </div>
+                )}
+
+                {/* Carousel: view on Instagram link */}
+                {p.isCarousel && (
+                  <div className="post-download" style={{ justifyContent:'flex-end' }}>
+                    <a href={p.pageUrl} target="_blank" rel="noopener noreferrer" className="btn-view">
+                      ↗ View on Instagram
+                    </a>
+                  </div>
+                )}
+              </article>
+            ) : (
+              <div className="error-box">
+                <div className="error-box__title"><span>⚠️</span> Couldn&apos;t fetch this post</div>
+                <div className="error-box__msg">{result.error}</div>
+                {result.hint && <div className="error-box__hint">💡 {result.hint}</div>}
               </div>
             )}
           </div>
-        </section>
+        )}
 
-        {/* ── How It Works ────────────────────────────── */}
-        <section className="steps-section" aria-labelledby="steps-title">
-          <div className="container">
-            <h2 id="steps-title" className="steps-section__title">
-              How It <span className="text-gradient">Works</span>
-            </h2>
-            <div className="steps-grid" role="list">
-              <div className="step-card" role="listitem">
-                <div className="step-card__number" aria-hidden="true">1</div>
-                <h3 className="step-card__title">Copy the Link</h3>
-                <p className="step-card__desc">
-                  Open any public Instagram post, reel, or photo. Copy the URL from your browser or the Instagram app.
-                </p>
-              </div>
-              <div className="step-card" role="listitem">
-                <div className="step-card__number" aria-hidden="true">2</div>
-                <h3 className="step-card__title">Paste &amp; Fetch</h3>
-                <p className="step-card__desc">
-                  Paste the link above and click &ldquo;Fetch Post&rdquo;. Our engine reverse-engineers Instagram&apos;s API to extract the highest-quality media.
-                </p>
-              </div>
-              <div className="step-card" role="listitem">
-                <div className="step-card__number" aria-hidden="true">3</div>
-                <h3 className="step-card__title">Download HD</h3>
-                <p className="step-card__desc">
-                  Click the download button to save the photo or video in full HD quality directly to your device.
-                </p>
-              </div>
+        {/* ── Features ── */}
+        <div className="features">
+          {[
+            { icon:'⚡', title:'HD Quality',   desc:'Highest resolution from CDN' },
+            { icon:'🗂️', title:'Carousels',    desc:'Download all album photos at once' },
+            { icon:'🎬', title:'Reels',        desc:'Full quality video downloads' },
+            { icon:'🛡️', title:'No Watermark', desc:'Clean original files' },
+            { icon:'🔒', title:'Private',      desc:'No data stored or tracked' },
+            { icon:'🆓', title:'Free',         desc:'Always free, open source' },
+          ].map(f => (
+            <div key={f.title} className="feat">
+              <div className="feat__icon">{f.icon}</div>
+              <div className="feat__title">{f.title}</div>
+              <div className="feat__desc">{f.desc}</div>
             </div>
-          </div>
-        </section>
-
-        {/* ── Features ────────────────────────────────── */}
-        <section className="features-section" aria-labelledby="features-title">
-          <div className="container container--wide">
-            <h2 id="features-title" className="features-section__title">
-              Why <span className="text-gradient">InstaDown</span>?
-            </h2>
-            <p className="features-section__subtitle">
-              Built on yt-dlp, the most powerful open-source media downloader
-            </p>
-            <div className="features-grid" role="list">
-              {[
-                {
-                  icon: '⚡',
-                  title: 'High Quality Downloads',
-                  desc: 'Automatically selects the highest resolution format available — no compression, no quality loss.',
-                },
-                {
-                  icon: '🔓',
-                  title: 'No Login Required',
-                  desc: 'Download any public post without signing in. Works with photos, videos, and Reels instantly.',
-                },
-                {
-                  icon: '🛠️',
-                  title: 'yt-dlp Powered',
-                  desc: 'Uses yt-dlp\'s reverse-engineered Instagram extractor to fetch direct CDN media URLs.',
-                },
-                {
-                  icon: '🖼️',
-                  title: 'Photos & Reels',
-                  desc: 'Supports single photos, carousels, and video Reels. All formats, all in one place.',
-                },
-                {
-                  icon: '🚫',
-                  title: 'No Watermarks',
-                  desc: 'Downloads the original media without any added watermarks or branding.',
-                },
-                {
-                  icon: '🌐',
-                  title: 'Open Source',
-                  desc: 'Built transparently on open-source tools. No data collection, no tracking.',
-                },
-              ].map((f) => (
-                <div className="feature-card" key={f.title} role="listitem">
-                  <div className="feature-card__icon" aria-hidden="true">{f.icon}</div>
-                  <h3 className="feature-card__title">{f.title}</h3>
-                  <p className="feature-card__desc">{f.desc}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        </section>
-      </main>
-
-      {/* ── Footer ──────────────────────────────────── */}
-      <footer className="footer" aria-label="Site footer">
-        <div className="container">
-          <p className="footer__text">
-            © {new Date().getFullYear()} InstaDown. Built with{' '}
-            <a href="https://github.com/yt-dlp/yt-dlp" target="_blank" rel="noopener noreferrer">
-              yt-dlp
-            </a>{' '}
-            &amp;{' '}
-            <a href="https://nextjs.org" target="_blank" rel="noopener noreferrer">
-              Next.js
-            </a>
-            .{' '}
-            <br />
-            For personal and educational use only. Respect content creators&apos; rights.
-          </p>
+          ))}
         </div>
-      </footer>
-    </div>
+
+        {/* ── Footer ── */}
+        <footer className="footer">
+          <span className="footer__logo">InstaDown</span>
+          <span className="footer__copy">© {new Date().getFullYear()} · Personal use only</span>
+        </footer>
+
+      </main>
+    </>
   );
 }

@@ -104,6 +104,11 @@ interface RelayMediaNode {
   video_view_count?: number;
   taken_at_timestamp?: number;
   owner?: { username: string; full_name: string };
+  edge_sidecar_to_children?: {
+    edges: Array<{
+      node: RelayMediaNode;
+    }>;
+  };
 }
 
 async function queryRelayGraphQL(
@@ -256,6 +261,13 @@ async function fetchOEmbed(url: string): Promise<OEmbedData | null> {
 }
 
 /* ─── Build result from RelayMediaNode ──────────────────────────────── */
+interface MediaItem {
+  url: string;
+  thumbnail: string;
+  mediaType: 'video' | 'image';
+  resolution?: string;
+}
+
 interface PostResult {
   id: string;
   shortcode: string;
@@ -273,6 +285,8 @@ interface PostResult {
   viewCount?: number;
   commentCount?: number;
   pageUrl: string;
+  mediaItems?: MediaItem[];  // carousel slides
+  isCarousel?: boolean;
 }
 
 function buildResult(node: RelayMediaNode, shortcode: string, pageUrl: string): PostResult {
@@ -294,11 +308,41 @@ function buildResult(node: RelayMediaNode, shortcode: string, pageUrl: string): 
     ? new Date(ts * 1000).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
     : undefined;
 
+  // ── Carousel / sidecar extraction ─────────────────────────────
+  const sidecarEdges = node.edge_sidecar_to_children?.edges;
+  let mediaItems: MediaItem[] | undefined;
+  let isCarousel = false;
+
+  if (sidecarEdges && sidecarEdges.length > 1) {
+    isCarousel = true;
+    mediaItems = sidecarEdges.map((edge) => {
+      const child = edge.node;
+      const childIsVideo = child.is_video || !!child.video_url;
+      let childThumb = child.display_url || child.thumbnail_src || '';
+      if (child.display_resources?.length) {
+        const s = [...child.display_resources].sort((a, b) => b.config_width - a.config_width);
+        childThumb = s[0].src || childThumb;
+      }
+      const childUrl = childIsVideo
+        ? (child.video_url ?? childThumb)
+        : (child.display_url ?? child.thumbnail_src ?? childThumb);
+      const childRes = child.dimensions
+        ? `${child.dimensions.width}x${child.dimensions.height}`
+        : undefined;
+      return {
+        url: childUrl,
+        thumbnail: childThumb,
+        mediaType: childIsVideo ? 'video' : 'image',
+        resolution: childRes,
+      } satisfies MediaItem;
+    });
+  }
+
   return {
     id: node.id ?? shortcode,
     shortcode,
     title: node.owner?.full_name
-      ? `${node.owner.full_name}'s ${isVideo ? 'Reel' : 'Photo'}`
+      ? `${node.owner.full_name}'s ${isCarousel ? 'Album' : isVideo ? 'Reel' : 'Photo'}`
       : 'Instagram Post',
     description: caption,
     uploader: node.owner?.full_name,
@@ -312,33 +356,13 @@ function buildResult(node: RelayMediaNode, shortcode: string, pageUrl: string): 
     viewCount: node.video_view_count,
     commentCount: node.edge_media_to_comment?.count,
     pageUrl: pageUrl.split('?')[0].replace(/\/$/, ''),
+    mediaItems,
+    isCarousel,
   };
 }
 
-/* ─── POST handler ───────────────────────────────────────────────────── */
-export async function POST(request: NextRequest) {
-  let body: { url?: string };
-  try { body = await request.json(); }
-  catch { return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 }); }
-
-  const { url } = body;
-  if (!url || typeof url !== 'string') {
-    return NextResponse.json({ error: 'URL is required' }, { status: 400 });
-  }
-
-  const igPattern = /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv|stories)\/[A-Za-z0-9_\-]+/;
-  if (!igPattern.test(url.trim())) {
-    return NextResponse.json(
-      { error: 'Please enter a valid Instagram URL (instagram.com/p/… or /reel/…)' },
-      { status: 400 }
-    );
-  }
-
-  const shortcode = extractShortcode(url.trim());
-  if (!shortcode) {
-    return NextResponse.json({ error: 'Could not extract post ID from URL.' }, { status: 400 });
-  }
-
+/* ─── Shared scraping logic ──────────────────────────────────────────── */
+async function scrapeAndRespond(shortcode: string, rawUrl: string) {
   const cookies = loadCookies();
   const hasCookies = cookies.length > 0;
 
@@ -365,7 +389,7 @@ export async function POST(request: NextRequest) {
 
     // Step 5: oEmbed partial fallback
     if (!node) {
-      const oembed = await fetchOEmbed(url.trim());
+      const oembed = await fetchOEmbed(rawUrl);
       if (oembed?.thumbnail_url) {
         return NextResponse.json({
           success: true,
@@ -383,7 +407,7 @@ export async function POST(request: NextRequest) {
               ? `${oembed.thumbnail_width}x${oembed.thumbnail_height}` : undefined,
             pageUrl: `https://www.instagram.com/p/${shortcode}/`,
           },
-          warning: 'Only preview available. The direct download link could not be extracted. Instagram may have updated their API — try refreshing your cookies.',
+          warning: 'Only preview available. The direct download link could not be extracted.',
         });
       }
 
@@ -396,11 +420,63 @@ export async function POST(request: NextRequest) {
       }, { status: 502 });
     }
 
-    const result = buildResult(node, shortcode, url.trim());
+    const result = buildResult(node, shortcode, rawUrl);
     return NextResponse.json({ success: true, data: result });
 
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     return NextResponse.json({ error: `Server error: ${msg}` }, { status: 500 });
   }
+}
+
+/* ─── GET handler ────────────────────────────────────────────────────── */
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const url = searchParams.get('url');
+
+  if (!url) {
+    return NextResponse.json({ error: 'URL is required' }, { status: 400 });
+  }
+
+  const igPattern = /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv|stories)\/[A-Za-z0-9_\-]+/;
+  if (!igPattern.test(url.trim())) {
+    return NextResponse.json(
+      { error: 'Please enter a valid Instagram URL (instagram.com/p/… or /reel/…)' },
+      { status: 400 }
+    );
+  }
+
+  const shortcode = extractShortcode(url.trim());
+  if (!shortcode) {
+    return NextResponse.json({ error: 'Could not extract post ID from URL.' }, { status: 400 });
+  }
+
+  return scrapeAndRespond(shortcode, url.trim());
+}
+
+/* ─── POST handler ───────────────────────────────────────────────────── */
+export async function POST(request: NextRequest) {
+  let body: { url?: string };
+  try { body = await request.json(); }
+  catch { return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 }); }
+
+  const { url } = body;
+  if (!url || typeof url !== 'string') {
+    return NextResponse.json({ error: 'URL is required' }, { status: 400 });
+  }
+
+  const igPattern = /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv|stories)\/[A-Za-z0-9_\-]+/;
+  if (!igPattern.test(url.trim())) {
+    return NextResponse.json(
+      { error: 'Please enter a valid Instagram URL (instagram.com/p/… or /reel/…)' },
+      { status: 400 }
+    );
+  }
+
+  const shortcode = extractShortcode(url.trim());
+  if (!shortcode) {
+    return NextResponse.json({ error: 'Could not extract post ID from URL.' }, { status: 400 });
+  }
+
+  return scrapeAndRespond(shortcode, url.trim());
 }
