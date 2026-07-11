@@ -26,6 +26,9 @@ export async function GET(request: NextRequest) {
     'cdninstagram.com',
     'fbcdn.net',
     'scontent.cdninstagram.com',
+    'twimg.com',
+    'twitter.com',
+    'x.com',
   ];
 
   const isAllowed = allowedDomains.some(
@@ -38,13 +41,15 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    const referer = mediaUrl.includes('twimg.com') ? 'https://x.com/' : 'https://www.instagram.com/';
     const response = await fetch(mediaUrl, {
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Referer: 'https://www.instagram.com/',
+        Referer: referer,
         Accept: '*/*',
       },
+      cache: 'no-store',
     });
 
     if (!response.ok) {
