@@ -416,6 +416,85 @@ function buildResult(node: RelayMediaNode, shortcode: string, pageUrl: string): 
   };
 }
 
+/* ─── Twitter Integration ────────────────────────────────────────────── */
+function getTwitterToken(id: string) {
+  return ((Number(id) / 1e15) * Math.PI)
+    .toString(36)
+    .replace(/(0+|\.)/g, '');
+}
+
+async function fetchTwitterPost(tweetId: string, rawUrl: string) {
+  try {
+    const token = getTwitterToken(tweetId);
+    const res = await fetch(`https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&token=${token}&lang=en`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      return NextResponse.json({ error: 'Twitter post not found or restricted.' }, { status: 404 });
+    }
+
+    const json = await res.json();
+    
+    // Extract video
+    const variants = json.video?.variants ?? [];
+    const mp4s = variants.filter((v: any) => v.type === 'video/mp4');
+    
+    // Sort by resolution width extracted from url string (e.g. vid/avc1/1280x720/...)
+    const getResWidth = (srcString: string) => {
+      const match = srcString.match(/\/(\d+)x(\d+)\//);
+      return match ? parseInt(match[1], 10) : 0;
+    };
+    mp4s.sort((a: any, b: any) => getResWidth(b.src ?? '') - getResWidth(a.src ?? ''));
+    const videoUrl = mp4s[0]?.src || null;
+    
+    const isVideo = !!json.video;
+    const photos = json.photos ?? [];
+    const isCarousel = photos.length > 1;
+
+    let mediaUrl = isVideo ? videoUrl : (photos[0]?.url || null);
+    let thumbnail = (isVideo ? json.video?.poster : null) || photos[0]?.url || json.user?.profile_image_url_https || null;
+
+    let mediaItems: MediaItem[] | undefined;
+    if (isCarousel) {
+      mediaItems = photos.map((p: any) => ({
+        url: p.url,
+        thumbnail: p.url,
+        mediaType: 'image',
+        resolution: p.width && p.height ? `${p.width}x${p.height}` : undefined,
+      }));
+    }
+
+    const result = {
+      id: tweetId,
+      shortcode: tweetId,
+      title: `${json.user?.name || 'X User'}'s Tweet`,
+      description: json.text,
+      uploader: json.user?.name,
+      uploaderUsername: json.user?.screen_name,
+      uploaderVerified: !!json.user?.verified,
+      thumbnail,
+      mediaUrl,
+      mediaType: isVideo ? 'video' : 'image',
+      resolution: photos[0] ? `${photos[0].width}x${photos[0].height}` : undefined,
+      uploadDate: json.created_at,
+      likeCount: json.favorite_count,
+      pageUrl: rawUrl,
+      mediaItems,
+      isCarousel,
+      isTwitter: true,
+    };
+
+    return NextResponse.json({ success: true, data: result });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    return NextResponse.json({ error: `Twitter fetch error: ${msg}` }, { status: 500 });
+  }
+}
+
 /* ─── Shared scraping logic ──────────────────────────────────────────── */
 async function scrapeAndRespond(shortcode: string, rawUrl: string) {
   const cookies = loadCookies();
@@ -493,20 +572,30 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'URL is required' }, { status: 400 });
   }
 
+  const trimmed = url.trim();
+
+  // Twitter/X pattern check
+  const twPattern = /^https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[^/]+\/status\/(\d+)/;
+  const twMatch = trimmed.match(twPattern);
+  if (twMatch) {
+    return fetchTwitterPost(twMatch[1], trimmed);
+  }
+
+  // Instagram pattern check
   const igPattern = /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv|stories)\/[A-Za-z0-9_\-]+/;
-  if (!igPattern.test(url.trim())) {
+  if (!igPattern.test(trimmed)) {
     return NextResponse.json(
-      { error: 'Please enter a valid Instagram URL (instagram.com/p/… or /reel/…)' },
+      { error: 'Please enter a valid Instagram or Twitter/X URL' },
       { status: 400 }
     );
   }
 
-  const shortcode = extractShortcode(url.trim());
+  const shortcode = extractShortcode(trimmed);
   if (!shortcode) {
     return NextResponse.json({ error: 'Could not extract post ID from URL.' }, { status: 400 });
   }
 
-  return scrapeAndRespond(shortcode, url.trim());
+  return scrapeAndRespond(shortcode, trimmed);
 }
 
 /* ─── POST handler ───────────────────────────────────────────────────── */
@@ -520,18 +609,28 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'URL is required' }, { status: 400 });
   }
 
+  const trimmed = url.trim();
+
+  // Twitter/X pattern check
+  const twPattern = /^https?:\/\/(?:www\.)?(?:twitter|x)\.com\/[^/]+\/status\/(\d+)/;
+  const twMatch = trimmed.match(twPattern);
+  if (twMatch) {
+    return fetchTwitterPost(twMatch[1], trimmed);
+  }
+
   const igPattern = /^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv|stories)\/[A-Za-z0-9_\-]+/;
-  if (!igPattern.test(url.trim())) {
+  if (!igPattern.test(trimmed)) {
     return NextResponse.json(
-      { error: 'Please enter a valid Instagram URL (instagram.com/p/… or /reel/…)' },
+      { error: 'Please enter a valid Instagram or Twitter/X URL' },
       { status: 400 }
     );
   }
 
-  const shortcode = extractShortcode(url.trim());
+  const shortcode = extractShortcode(trimmed);
   if (!shortcode) {
     return NextResponse.json({ error: 'Could not extract post ID from URL.' }, { status: 400 });
   }
 
-  return scrapeAndRespond(shortcode, url.trim());
+  return scrapeAndRespond(shortcode, trimmed);
 }
+

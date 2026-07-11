@@ -16,6 +16,12 @@
   --ig-purple:  #833ab4;
   --ig-orange:  #f09433;
 
+  /* X / Twitter palette */
+  --tw-blue:      #1d9bf0;
+  --tw-black:     #0f1419;
+  --tw-border:    #cfd9de;
+  --tw-gradient:  linear-gradient(45deg, #0f1419 0%, #2a343d 50%, #1d9bf0 100%);
+
   /* Surface */
   --white:      #ffffff;
   --bg:         #fafafa;
@@ -881,3 +887,203 @@ input, textarea { font-family: var(--font); }
   width: 14px; height: 14px;
   border-width: 2px;
 }
+
+/* ─── Page Title Section ─────────────────────────────────── */
+.page-title-section {
+  text-align: center;
+  margin-bottom: 2.5rem;
+}
+.main-title {
+  font-size: 2.2rem;
+  font-weight: 900;
+  letter-spacing: -0.05em;
+  color: var(--text);
+  line-height: 1.15;
+  margin-bottom: 0.5rem;
+}
+.main-sub {
+  font-size: 0.95rem;
+  color: var(--text-2);
+  max-width: 480px;
+  margin: 0 auto;
+  line-height: 1.5;
+}
+
+/* ─── Dual Column Layout ─────────────────────────────────── */
+.dual-page {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2.5rem;
+}
+
+.downloader-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  align-items: start;
+}
+
+.downloader-col {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  width: 100%;
+}
+
+/* Column Header */
+.col-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+}
+.col-header__icon {
+  width: 48px; height: 48px;
+  border-radius: 12px;
+  background: var(--ig-gradient);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.5rem;
+  color: white;
+  margin-bottom: 0.5rem;
+  box-shadow: 0 4px 12px rgba(131,58,180,0.2);
+}
+.col-header__icon.twitter-theme-icon {
+  background: var(--tw-gradient);
+  box-shadow: 0 4px 12px rgba(15,20,25,0.25);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-weight: 700;
+}
+.col-header__title {
+  font-size: 1.4rem;
+  font-weight: 850;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  margin-bottom: 0.25rem;
+}
+.col-header__sub {
+  font-size: 0.82rem;
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+/* Accent Gradients */
+.accent-ig {
+  background: var(--ig-gradient-h);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.accent-tw {
+  background: var(--tw-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ─── Twitter Specific Styling ──────────────────────────── */
+
+/* Input / button focus for Twitter */
+.input-wrap:focus-within:has(.url-input[placeholder*="X"]) {
+  border-color: var(--tw-black);
+  box-shadow: 0 0 0 3px rgba(15,20,25,0.08);
+}
+
+.btn-fetch.twitter-btn {
+  background: var(--tw-gradient);
+  box-shadow: 0 4px 20px rgba(15,20,25,0.2);
+}
+.btn-fetch.twitter-btn:hover:not(:disabled) {
+  box-shadow: 0 8px 24px rgba(15,20,25,0.3);
+}
+
+/* Twitter specific preview card */
+.post-card.twitter-post-card {
+  border-color: var(--tw-border);
+}
+
+.avatar-ring.twitter-avatar {
+  background: var(--tw-gradient);
+}
+.avatar-inner.twitter-avatar-inner {
+  background: var(--tw-black);
+}
+
+/* Twitter Blue Verified Checkmark Badge */
+.verified-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--tw-blue);
+  color: white;
+  font-size: 0.58rem;
+  font-weight: 800;
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  margin-left: 4px;
+  vertical-align: middle;
+  line-height: 1;
+}
+
+/* Twitter buttons inside card */
+.btn-download-main.twitter-gradient-btn,
+.btn-slide-dl.twitter-btn,
+.btn-dl-all.twitter-gradient-btn {
+  background: var(--tw-gradient);
+  box-shadow: 0 3px 14px rgba(15,20,25,0.2);
+}
+.btn-download-main.twitter-gradient-btn:hover:not(:disabled),
+.btn-slide-dl.twitter-btn:hover:not(:disabled),
+.btn-dl-all.twitter-gradient-btn:hover:not(:disabled) {
+  box-shadow: 0 6px 18px rgba(15,20,25,0.3);
+}
+
+/* Strip thumb border for active twitter */
+.strip-thumb.active.twitter-active {
+  border-color: var(--tw-blue);
+}
+.dot.active.twitter-active-dot {
+  background: var(--tw-blue);
+}
+
+/* Supported hint line */
+.supported-hint {
+  font-size: 0.72rem;
+  color: var(--text-3);
+  text-align: left;
+}
+
+/* Responsive adjustment */
+@media (max-width: 768px) {
+  .downloader-grid {
+    grid-template-columns: 1fr;
+    gap: 2.5rem;
+  }
+  .dual-page {
+    padding: 2rem 1rem 4rem;
+  }
+}
+
+/* Post video container */
+.post-video-container {
+  width: 100%;
+  aspect-ratio: 1;
+  background: #000;
+  position: relative;
+  overflow: hidden;
+  max-height: 400px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.post-video {
+  width: 100%;
+  height: 100%;
+  max-height: 400px;
+  object-fit: contain;
+  display: block;
+}
+
+
