@@ -76,13 +76,23 @@ function CarouselSlide({
     <div className="slide">
       <div className="slide__counter">{index + 1} / {total}</div>
       <div className="slide__media">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={proxyUrl(item.thumbnail, true)}
-          alt={`Slide ${index + 1}`}
-          loading="lazy"
-        />
-        {item.mediaType === 'video' && <div className="video-badge">▶ {isTwitter ? 'Video' : 'Reel'}</div>}
+        {item.mediaType === 'video' ? (
+          <video
+            src={proxyUrl(item.url, true)}
+            poster={item.thumbnail ? proxyUrl(item.thumbnail, true) : undefined}
+            controls
+            playsInline
+            className="post-video"
+            style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#000' }}
+          />
+        ) : (
+          /* eslint-disable-next-line @next/next/no-img-element */
+          <img
+            src={proxyUrl(item.thumbnail, true)}
+            alt={`Slide ${index + 1}`}
+            loading="lazy"
+          />
+        )}
       </div>
       <div className="slide__actions">
         {item.resolution && <span className="slide__res">{item.resolution}</span>}
